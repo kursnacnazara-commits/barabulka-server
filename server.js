@@ -13,9 +13,14 @@ const app = express();
 const server = http.createServer(app);
 
 // 3. Підключення до MongoDB Atlas (хмара)
-const MONGO_URI = "mongodb+srv://nazar:Barabulka123@cluster0.ayxyg57.mongodb.net/?retryWrites=true&w=majority&authSource=admin";
+// ВАЖЛИВО: адреса бази з паролем більше НЕ зберігається в коді (репозиторій публічний!).
+// Її треба додати в Railway → сервіс barabulka-server → Variables → змінна MONGO_URI.
+const MONGO_URI = process.env.MONGO_URI;
+if (!MONGO_URI) {
+  console.error('❌ Не задано змінну MONGO_URI у Railway → Variables. Повідомлення не зберігатимуться!');
+}
 
-mongoose.connect(MONGO_URI)
+mongoose.connect(MONGO_URI || 'mongodb://missing-MONGO_URI')
     .then(() => console.log('✅ Успішно підключено до бази даних MongoDB Atlas!'))
     .catch(err => console.error('❌ Помилка бази даних:', err));
 
@@ -34,11 +39,15 @@ const Message = mongoose.model('Message', messageSchema);
 // Middleware
 app.use(cors());
 app.use(express.json());
+// Railway працює через проксі: так req.protocol буде "https", а не "http"
+app.set('trust proxy', true);
 
-// Перевіряємо та створюємо папку для завантажень uploads
-const uploadDir = path.join(__dirname, 'uploads');
+// Папка для завантажених фото/відео/голосових.
+// На Railway до неї підключено Volume "barabulka-server-volume" (шлях /app/uploads),
+// тому файли НЕ зникають при оновленні сервера. Змінну UPLOAD_DIR задавати не потрібно.
+const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 // Робимо папку uploads публічною
@@ -47,14 +56,14 @@ app.use('/uploads', express.static(uploadDir));
 // Налаштування Multer для збереження файлів
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
     cb(null, uniqueSuffix + path.extname(file.originalname));
   }
 });
-const upload = multer({ storage: storage });
+const upload = multer({ storage: storage, limits: { fileSize: 200 * 1024 * 1024 } }); // до 200 МБ
 
 const gallery = []; // Тимчасова галерея
 
@@ -82,6 +91,7 @@ io.on('connection', async (socket) => {
       // Відправляємо історію повідомлень тільки для цієї кімнати
       const history = await Message.find({ room: room }).sort({ timestamp: 1 });
       socket.emit('initial_messages', history);
+      socket.emit('chat_history', history); // назва, яку чекала стара версія додатка
     } catch (err) {
       console.error('Помилка завантаження історії кімнати:', err);
     }
@@ -89,12 +99,22 @@ io.on('connection', async (socket) => {
 
   // Обробка отримання та збереження нового повідомлення
   socket.on('send_message', async (data) => {
-    console.log('[Socket] Отримано повідомлення:', data);
+    // Не пишемо в логи сам текст — це приватне листування
+    console.log(`[Socket] Повідомлення від ${data.sender}${data.isMedia ? ' (' + data.mediaType + ')' : ''}`);
     const room = data.room || socket.room || 'default_room';
     
     // Якщо це службова дія (улюбленці, карта - починається з __ACTION__),
     // миттєво розсилаємо її в кімнату, НЕ зберігаючи в базу даних чату
     if (data.text && data.text.startsWith('__ACTION__:')) {
+      // Видалення повідомлень — прибираємо їх і з бази, щоб не поверталися в історії
+      try {
+        const action = JSON.parse(data.text.slice('__ACTION__:'.length));
+        if (action.type === 'DELETE_MESSAGES' && Array.isArray(action.texts) && action.texts.length) {
+          await Message.deleteMany({ room: room, text: { $in: action.texts } });
+        }
+      } catch (e) {
+        console.error('Помилка обробки дії:', e.message);
+      }
       io.to(room).emit('receive_message', data);
       return;
     }
@@ -157,12 +177,13 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     return res.status(400).json({ error: 'Файл не завантажено' });
   }
 
-  const fileUrl = `http://${req.headers.host}/uploads/${req.file.filename}`;
+  const fileUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
   
   const mediaItem = {
     url: fileUrl,
     filename: req.file.filename,
-    type: req.file.mimetype.startsWith('image/') ? 'image' : 'video',
+    type: req.file.mimetype.startsWith('image/') ? 'image'
+        : req.file.mimetype.startsWith('audio/') ? 'audio' : 'video',
     createdAt: new Date()
   };
 
