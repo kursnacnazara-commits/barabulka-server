@@ -91,7 +91,7 @@ function isPersistentAction(type) {
   if (!type) return false;
   if (type.startsWith('WEBRTC_')) return false;
   // TYPING («друкує…») — миттєвий сигнал, зберігати немає сенсу
-  return !['INCOMING_CALL', 'ACCEPT_CALL', 'DECLINE_CALL', 'END_CALL', 'TYPING'].includes(type);
+  return !['INCOMING_CALL', 'ACCEPT_CALL', 'DECLINE_CALL', 'END_CALL', 'TYPING', 'KISS_TOUCH'].includes(type);
 }
 // Для цих дій важливий лише останній стан — старі копії замінюємо новою
 // (улюбленці синхронізуються кожні 45 секунд, нема сенсу зберігати тисячі копій).
@@ -335,6 +335,24 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
     url: fileUrl,
     type: mediaItem.type
   });
+});
+
+// Сервери для відеодзвінків (STUN + TURN). TURN потрібен, коли обидва телефони за мобільним інтернетом/NAT.
+// Можна задати свої через змінні Railway: ICE_SERVERS (JSON) або TURN_HOST + TURN_SECRET.
+app.get('/api/ice', (req, res) => {
+  const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  if (process.env.ICE_SERVERS) {
+    try { return res.json({ iceServers: JSON.parse(process.env.ICE_SERVERS) }); } catch (e) { /* невалідний JSON — беремо типові */ }
+  }
+  const secret = process.env.TURN_SECRET || 'openrelayprojectsecret';
+  const host = process.env.TURN_HOST || 'staticauth.openrelay.metered.ca';
+  const username = `${Math.floor(Date.now() / 1000) + 24 * 3600}:barabulka`;
+  const credential = require('crypto').createHmac('sha1', secret).update(username).digest('base64');
+  servers.push({
+    urls: [`turn:${host}:80`, `turn:${host}:80?transport=tcp`, `turn:${host}:443`, `turns:${host}:443?transport=tcp`],
+    username, credential
+  });
+  res.json({ iceServers: servers });
 });
 
 // Альбом
