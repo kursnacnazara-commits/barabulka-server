@@ -72,6 +72,67 @@ const messageSchema = new mongoose.Schema({
 
 const Message = mongoose.model('Message', messageSchema);
 
+// Дії партнера (фон, улюбленці, квести, карта, віджети...).
+// Зберігаємо їх, щоб телефон, який був офлайн, отримав пропущене після підключення.
+// Старі записи MongoDB сама видаляє через 90 днів.
+const actionSchema = new mongoose.Schema({
+    room: String,
+    sender: String,
+    type: String,
+    text: String,
+    timestamp: { type: Date, default: Date.now, expires: 60 * 60 * 24 * 90 }
+});
+actionSchema.index({ room: 1, timestamp: 1 });
+const Action = mongoose.model('Action', actionSchema);
+
+// Які дії зберігати. Дзвінки НЕ зберігаємо: старий дзвінок через годину нікому не потрібен.
+const PERSISTENT_ACTIONS = new Set([
+  'SET_BACKGROUND', 'DELETE_MESSAGES', 'ADD_REACTION',
+  'PETS_SYNC', 'POINTS_SYNC',
+  'ADD_QUEST', 'COMPLETE_QUEST', 'ADD_SHOP', 'BUY_SHOP',
+  'CONFIRM_VISIT', 'ADD_MEMORY_PHOTO', 'DELETE_MEMORY_PHOTO',
+  'WIDGET_PHOTO_SYNC', 'WIDGET_DRAWING_SYNC'
+]);
+// Для цих дій важливий лише останній стан — старі копії замінюємо новою
+// (улюбленці синхронізуються кожні 45 секунд, нема сенсу зберігати тисячі копій).
+const LATEST_ONLY_ACTIONS = new Set(['PETS_SYNC', 'POINTS_SYNC', 'SET_BACKGROUND', 'WIDGET_PHOTO_SYNC']);
+
+const MEMORY_ACTIONS_LIMIT = 1000;
+const memoryActions = new Map(); // room -> [дії]
+
+async function storeAction(rec) {
+  let list = memoryActions.get(rec.room) || [];
+  if (LATEST_ONLY_ACTIONS.has(rec.type)) {
+    list = list.filter(a => !(a.type === rec.type && a.sender === rec.sender));
+  }
+  list.push(rec);
+  if (list.length > MEMORY_ACTIONS_LIMIT) list.splice(0, list.length - MEMORY_ACTIONS_LIMIT);
+  memoryActions.set(rec.room, list);
+
+  if (!dbReady) return;
+  try {
+    if (LATEST_ONLY_ACTIONS.has(rec.type)) {
+      await Action.deleteMany({ room: rec.room, type: rec.type, sender: rec.sender });
+    }
+    await new Action(rec).save();
+  } catch (err) {
+    console.error('Помилка збереження дії:', err.message);
+  }
+}
+
+async function loadMissedActions(room, username, since) {
+  if (dbReady) {
+    try {
+      return await Action.find({ room: room, sender: { $ne: username }, timestamp: { $gt: new Date(since) } })
+        .sort({ timestamp: 1 }).limit(MEMORY_ACTIONS_LIMIT).lean();
+    } catch (err) {
+      console.error('Помилка завантаження пропущених дій:', err.message);
+    }
+  }
+  return (memoryActions.get(room) || [])
+    .filter(a => a.sender !== username && new Date(a.timestamp).getTime() > since);
+}
+
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -133,6 +194,16 @@ io.on('connection', async (socket) => {
     }
     socket.emit('initial_messages', history);
     socket.emit('chat_history', history); // назва, яку чекала стара версія додатка
+
+    // Нова версія додатка надсилає "since" — час останньої дії партнера, яку телефон уже отримав.
+    // Досилаємо все, що партнер зробив після цього, поки телефон був офлайн.
+    if (data.since !== undefined) {
+      const now = Date.now();
+      const since = Number(data.since) || 0;
+      const actions = since > 0 ? await loadMissedActions(room, data.username, since) : [];
+      socket.emit('missed_actions', { actions: actions, now: now });
+      if (actions.length) console.log(`[Socket] Дослано пропущених дій: ${actions.length}`);
+    }
   });
 
   // Обробка отримання та збереження нового повідомлення
@@ -144,16 +215,42 @@ io.on('connection', async (socket) => {
     // Якщо це службова дія (улюбленці, карта - починається з __ACTION__),
     // миттєво розсилаємо її в кімнату, НЕ зберігаючи в базу даних чату
     if (data.text && data.text.startsWith('__ACTION__:')) {
-      io.to(room).emit('receive_message', data);
-      // Видалення повідомлень — прибираємо їх і з бази, щоб не поверталися в історії
+      let action = null;
       try {
-        const action = JSON.parse(data.text.slice('__ACTION__:'.length));
-        if (action.type === 'DELETE_MESSAGES' && Array.isArray(action.texts) && action.texts.length) {
-          forgetTexts(room, action.texts);
-          if (dbReady) await Message.deleteMany({ room: room, text: { $in: action.texts } });
-        }
+        action = JSON.parse(data.text.slice('__ACTION__:'.length));
       } catch (e) {
         console.error('Помилка обробки дії:', e.message);
+      }
+      const type = action && action.type;
+
+      // Кожна дія отримує номер і час — так телефон не обробить її двічі
+      // і знатиме, з якого моменту просити пропущене.
+      const rec = {
+        _id: new mongoose.Types.ObjectId(),
+        room: room,
+        sender: data.sender,
+        type: type || '',
+        text: data.text,
+        isMedia: false,
+        mediaType: null,
+        timestamp: new Date()
+      };
+      io.to(room).emit('receive_message', rec);
+
+      // Видалення повідомлень — прибираємо їх і з бази, щоб не поверталися в історії
+      if (type === 'DELETE_MESSAGES' && Array.isArray(action.texts) && action.texts.length) {
+        forgetTexts(room, action.texts);
+        if (dbReady) {
+          try {
+            await Message.deleteMany({ room: room, text: { $in: action.texts } });
+          } catch (e) {
+            console.error('Помилка видалення повідомлень:', e.message);
+          }
+        }
+      }
+
+      if (PERSISTENT_ACTIONS.has(type)) {
+        await storeAction({ _id: rec._id, room: room, sender: rec.sender, type: type, text: rec.text, timestamp: rec.timestamp });
       }
       return;
     }
