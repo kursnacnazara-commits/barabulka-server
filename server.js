@@ -90,12 +90,13 @@ const Action = mongoose.model('Action', actionSchema);
 function isPersistentAction(type) {
   if (!type) return false;
   if (type.startsWith('WEBRTC_')) return false;
-  return !['INCOMING_CALL', 'ACCEPT_CALL', 'DECLINE_CALL', 'END_CALL'].includes(type);
+  // TYPING («друкує…») — миттєвий сигнал, зберігати немає сенсу
+  return !['INCOMING_CALL', 'ACCEPT_CALL', 'DECLINE_CALL', 'END_CALL', 'TYPING'].includes(type);
 }
 // Для цих дій важливий лише останній стан — старі копії замінюємо новою
 // (улюбленці синхронізуються кожні 45 секунд, нема сенсу зберігати тисячі копій).
 const LATEST_ONLY_ACTIONS = new Set([
-  'PETS_SYNC', 'POINTS_SYNC', 'SET_BACKGROUND', 'WIDGET_PHOTO_SYNC', 'WIDGET_NOTE_SYNC', 'MOOD_SYNC', 'MEETING_SYNC'
+  'PETS_SYNC', 'POINTS_SYNC', 'SET_BACKGROUND', 'WIDGET_PHOTO_SYNC', 'WIDGET_NOTE_SYNC', 'MOOD_SYNC', 'MEETING_SYNC', 'READ_UP_TO'
 ]);
 
 const MEMORY_ACTIONS_LIMIT = 1000;
