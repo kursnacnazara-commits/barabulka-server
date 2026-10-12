@@ -85,17 +85,18 @@ const actionSchema = new mongoose.Schema({
 actionSchema.index({ room: 1, timestamp: 1 });
 const Action = mongoose.model('Action', actionSchema);
 
-// Які дії зберігати. Дзвінки НЕ зберігаємо: старий дзвінок через годину нікому не потрібен.
-const PERSISTENT_ACTIONS = new Set([
-  'SET_BACKGROUND', 'DELETE_MESSAGES', 'ADD_REACTION',
-  'PETS_SYNC', 'POINTS_SYNC',
-  'ADD_QUEST', 'COMPLETE_QUEST', 'ADD_SHOP', 'BUY_SHOP',
-  'CONFIRM_VISIT', 'ADD_MEMORY_PHOTO', 'DELETE_MEMORY_PHOTO',
-  'WIDGET_PHOTO_SYNC', 'WIDGET_DRAWING_SYNC'
-]);
+// Які дії НЕ зберігати: дзвінки. Старий дзвінок через годину нікому не потрібен.
+// Усе інше (фон, улюбленці, квести, карта, віджети, записки і майбутні нові функції) зберігаємо.
+function isPersistentAction(type) {
+  if (!type) return false;
+  if (type.startsWith('WEBRTC_')) return false;
+  return !['INCOMING_CALL', 'ACCEPT_CALL', 'DECLINE_CALL', 'END_CALL'].includes(type);
+}
 // Для цих дій важливий лише останній стан — старі копії замінюємо новою
 // (улюбленці синхронізуються кожні 45 секунд, нема сенсу зберігати тисячі копій).
-const LATEST_ONLY_ACTIONS = new Set(['PETS_SYNC', 'POINTS_SYNC', 'SET_BACKGROUND', 'WIDGET_PHOTO_SYNC']);
+const LATEST_ONLY_ACTIONS = new Set([
+  'PETS_SYNC', 'POINTS_SYNC', 'SET_BACKGROUND', 'WIDGET_PHOTO_SYNC', 'WIDGET_NOTE_SYNC', 'MOOD_SYNC', 'MEETING_SYNC'
+]);
 
 const MEMORY_ACTIONS_LIMIT = 1000;
 const memoryActions = new Map(); // room -> [дії]
@@ -249,7 +250,7 @@ io.on('connection', async (socket) => {
         }
       }
 
-      if (PERSISTENT_ACTIONS.has(type)) {
+      if (isPersistentAction(type)) {
         await storeAction({ _id: rec._id, room: room, sender: rec.sender, type: type, text: rec.text, timestamp: rec.timestamp });
       }
       return;
