@@ -339,20 +339,69 @@ app.post('/api/upload', upload.single('file'), (req, res) => {
 
 // Сервери для відеодзвінків (STUN + TURN). TURN потрібен, коли обидва телефони за мобільним інтернетом/NAT.
 // Можна задати свої через змінні Railway: ICE_SERVERS (JSON) або TURN_HOST + TURN_SECRET.
-app.get('/api/ice', (req, res) => {
-  const servers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
-  if (process.env.ICE_SERVERS) {
-    try { return res.json({ iceServers: JSON.parse(process.env.ICE_SERVERS) }); } catch (e) { /* невалідний JSON — беремо типові */ }
-  }
-  const secret = process.env.TURN_SECRET || 'openrelayprojectsecret';
-  const host = process.env.TURN_HOST || 'staticauth.openrelay.metered.ca';
-  const username = `${Math.floor(Date.now() / 1000) + 24 * 3600}:barabulka`;
-  const credential = require('crypto').createHmac('sha1', secret).update(username).digest('base64');
-  servers.push({
-    urls: [`turn:${host}:80`, `turn:${host}:80?transport=tcp`, `turn:${host}:443`, `turns:${host}:443?transport=tcp`],
-    username, credential
+// Безкоштовний публічний Open Relay перестав відповідати, тому TURN беремо з облікового запису:
+//  METERED_TURN_URL = https://<назва>.metered.live/api/v1/turn/credentials?apiKey=<ключ>   (Metered / Open Relay, 20 ГБ/міс безкоштовно)
+//  або CF_TURN_KEY_ID + CF_TURN_TOKEN                                                     (Cloudflare TURN)
+//  або ICE_SERVERS = готовий JSON-список серверів.
+const STUN_SERVERS = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+let iceCache = null;
+let iceCacheAt = 0;
+
+function httpsJson(url, options = {}, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = require('https').request(url, { method: options.method || 'GET', headers: options.headers || {}, timeout: 5000 }, (res) => {
+      let data = '';
+      res.on('data', (c) => { data += c; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch (e) { reject(new Error('HTTP ' + res.statusCode + ': не JSON')); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    if (body) req.write(body);
+    req.end();
   });
-  res.json({ iceServers: servers });
+}
+
+async function loadTurnServers() {
+  if (process.env.METERED_TURN_URL) {
+    const list = await httpsJson(process.env.METERED_TURN_URL);
+    if (Array.isArray(list) && list.length) return list;
+    throw new Error('Metered: порожня відповідь');
+  }
+  if (process.env.CF_TURN_KEY_ID && process.env.CF_TURN_TOKEN) {
+    const body = JSON.stringify({ ttl: 86400 });
+    const j = await httpsJson(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${process.env.CF_TURN_KEY_ID}/credentials/generate-ice-servers`,
+      { method: 'POST', headers: { Authorization: `Bearer ${process.env.CF_TURN_TOKEN}`, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } },
+      body
+    );
+    if (j && Array.isArray(j.iceServers)) {
+      // порт 53 у браузерах і на телефонах часто зависає — прибираємо
+      return j.iceServers.map((srv) => ({ ...srv, urls: [].concat(srv.urls).filter((u) => !/:53(\?|$)/.test(u)) }));
+    }
+    throw new Error('Cloudflare: немає iceServers');
+  }
+  return null;
+}
+
+app.get('/api/ice', async (req, res) => {
+  if (process.env.ICE_SERVERS) {
+    try { return res.json({ iceServers: JSON.parse(process.env.ICE_SERVERS) }); } catch (e) { /* невалідний JSON — беремо інші */ }
+  }
+  if (iceCache && Date.now() - iceCacheAt < 60 * 60 * 1000) return res.json({ iceServers: iceCache, turn: true });
+  try {
+    const turn = await loadTurnServers();
+    if (turn) {
+      iceCache = STUN_SERVERS.concat(turn);
+      iceCacheAt = Date.now();
+      return res.json({ iceServers: iceCache, turn: true });
+    }
+  } catch (e) {
+    console.error('[TURN] Не вдалося отримати сервери:', e.message);
+  }
+  // TURN не налаштовано — лише STUN (дзвінки працюють, коли хоча б в одного з вас Wi-Fi)
+  res.json({ iceServers: STUN_SERVERS, turn: false });
 });
 
 // Альбом
